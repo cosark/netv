@@ -226,6 +226,18 @@ def stop_session(session_id: str, force: bool = False) -> None:
     log.info("Stopped transcode session %s", session_id)
 
 
+def stop_user_stream(username: str, url: str) -> None:
+    """Stop a user's sessions of a stream, freeing its upstream connection."""
+    with _transcode_lock:
+        matches = [
+            sid
+            for sid, s in _transcode_sessions.items()
+            if s.get("username") == username and url in (s.get("url"), s.get("request_url"))
+        ]
+    for session_id in matches:
+        stop_session(session_id, force=True)
+
+
 def cleanup_expired_sessions() -> None:
     """Clean up all expired sessions (VOD and live)."""
     with _transcode_lock:
@@ -1053,6 +1065,7 @@ async def _do_start_transcode(
     resolved_url: the variant ``url`` already resolved to, saving a second fetch.
     """
     is_archive = _is_archive_url(url)
+    request_url = url
     # Resolve HLS master playlist to highest bandwidth variant
     url = resolved_url or await asyncio.to_thread(resolve_hls_master_playlist, url)
 
@@ -1154,6 +1167,7 @@ async def _do_start_transcode(
             "process": process,
             "started": time.time(),
             "url": url,
+            "request_url": request_url,
             "is_vod": is_vod,
             "is_archive": is_archive,
             "last_access": time.time(),

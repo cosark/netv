@@ -56,7 +56,13 @@ struct PlayerView: View {
         ZStack {
             Color.black
             if let player {
+                #if os(iOS)
+                PlayerController(player: player, isCatchup: selection.isCatchup) { active in
+                    model.isPictureInPictureActive = active
+                }
+                #else
                 PlayerController(player: player, isCatchup: selection.isCatchup)
+                #endif
             } else if let errorMessage {
                 ContentUnavailableView(
                     "Unable to Play",
@@ -624,11 +630,20 @@ struct PlayerView: View {
                 var sampler = PlaybackHealthSampler()
                 var shouldRetune = false
                 var deferredSaverDecision: Bool?
+                var nextHandoffReport = Date()
                 while !Task.isCancelled {
                     try await Task.sleep(for: .seconds(2))
                     quality = qualityLabel(for: item.presentationSize)
                     if item.status == .failed {
                         throw item.error ?? APIError.server("The stream could not be played.")
+                    }
+                    if let position = handoffPosition(of: currentPlayer) {
+                        model.watchPosition = position
+                        if Date() >= nextHandoffReport {
+                            nextHandoffReport = Date().addingTimeInterval(15)
+                            let playing = selection
+                            Task { await model.reportWatch(playing, position: position) }
+                        }
                     }
                     if model.isPlayerExpanded, !selection.isCatchup, liveProgram == nil,
                        Date() >= nextLiveGuideRefresh {
@@ -645,6 +660,7 @@ struct PlayerView: View {
                     }
                     #if os(iOS) || os(macOS)
                     airPlayActive = currentPlayer.isExternalPlaybackActive
+                    model.isExternalPlaybackActive = airPlayActive
                     // The TV fetches segments itself, which keeps the session alive. Swapping
                     // players for a quality change would drop the AirPlay route.
                     if airPlayActive { continue }
@@ -725,6 +741,22 @@ struct PlayerView: View {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// The broadcast moment on screen, in Unix time, for handing playback off.
+    private func handoffPosition(of player: AVPlayer) -> Double? {
+        let time = player.currentTime().seconds
+        guard time.isFinite else { return nil }
+        if let requested = selection.catchupStart {
+            return (archiveStreamStart ?? floor(requested / 60) * 60) + time
+        }
+        if let date = player.currentItem?.currentDate() {
+            return date.timeIntervalSince1970
+        }
+        // Without dated segments, measure back from the live edge.
+        let now = Date().timeIntervalSince1970
+        guard let edge = seekableRanges(in: player.currentItem).last?.upperBound else { return now }
+        return now - max(0, edge - time)
     }
 
     /// Carries on past the end of an archived program instead of stopping there.
@@ -1304,6 +1336,11 @@ private struct IOSControlBar: View {
 private struct PlayerController: UIViewControllerRepresentable {
     let player: AVPlayer
     let isCatchup: Bool
+    var onPictureInPictureChange: (Bool) -> Void = { _ in }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onChange: onPictureInPictureChange)
+    }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
@@ -1312,7 +1349,25 @@ private struct PlayerController: UIViewControllerRepresentable {
         controller.allowsPictureInPicturePlayback = true
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         controller.updatesNowPlayingInfoCenter = true
+        controller.delegate = context.coordinator
         return controller
+    }
+
+    /// Picture in Picture keeps playing in the background, so leaving the app isn't stopping.
+    final class Coordinator: NSObject, AVPlayerViewControllerDelegate {
+        let onChange: (Bool) -> Void
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+        }
+
+        func playerViewControllerWillStartPictureInPicture(_ controller: AVPlayerViewController) {
+            onChange(true)
+        }
+
+        func playerViewControllerDidStopPictureInPicture(_ controller: AVPlayerViewController) {
+            onChange(false)
+        }
     }
 
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {

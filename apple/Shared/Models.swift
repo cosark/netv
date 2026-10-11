@@ -237,12 +237,76 @@ struct Program: Decodable, Hashable {
         return min(max(now.timeIntervalSince(todayStart) / todayEnd.timeIntervalSince(todayStart), 0), 1)
     }
 
-    private static let timeFormatter: DateFormatter = {
+    fileprivate static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm"
         return formatter
     }()
+}
+
+extension Program {
+    /// A program known only from its times, such as a handoff's.
+    init(title: String, startTimestamp: Double?, endTimestamp: Double?) {
+        let format = { (timestamp: Double?) in
+            timestamp.map { Self.timeFormatter.string(from: Date(timeIntervalSince1970: $0)) } ?? ""
+        }
+        self.title = title
+        desc = ""
+        start = format(startTimestamp)
+        end = format(endTimestamp)
+        leftPercent = 0
+        widthPercent = 0
+        self.startTimestamp = startTimestamp
+        self.endTimestamp = endTimestamp
+        catchup = false
+        unavailable = false
+    }
+}
+
+/// A channel left playing on another device, offered to resume where it stopped.
+struct Handoff: Decodable, Identifiable, Hashable {
+    let id: String
+    let streamID: String
+    let channelName: String
+    let programTitle: String
+    let programStart: Double
+    let programEnd: Double
+    /// Unix time of the broadcast moment playback stopped at.
+    let position: Double
+
+    enum CodingKeys: String, CodingKey {
+        case id, position
+        case streamID = "stream_id"
+        case channelName = "channel_name"
+        case programTitle = "program_title"
+        case programStart = "program_start"
+        case programEnd = "program_end"
+    }
+
+    var program: Program? {
+        guard programEnd > programStart else { return nil }
+        return Program(
+            title: programTitle.isEmpty ? channelName : programTitle,
+            startTimestamp: programStart, endTimestamp: programEnd
+        )
+    }
+}
+
+struct HandoffResponse: Decodable {
+    let handoff: Handoff?
+}
+
+struct HandoffReport: Encodable {
+    let streamID: String
+    let position: Double
+    let handoffID: String
+
+    enum CodingKeys: String, CodingKey {
+        case position
+        case streamID = "stream_id"
+        case handoffID = "handoff_id"
+    }
 }
 
 struct FlexibleID: Decodable, Hashable {
@@ -279,6 +343,9 @@ struct PlayerSelection: Identifiable, Hashable {
     /// Requested Unix position within the upstream archive; nil plays live.
     var catchupStart: Double?
     var startPaused = false
+    /// The handoff this playback resumes, carried through its seeks so the
+    /// server keeps the recording it plays from.
+    var handoffID: String?
 
     var isCatchup: Bool { catchupStart != nil }
 

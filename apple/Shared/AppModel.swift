@@ -18,7 +18,22 @@ final class AppModel: ObservableObject {
     private var guideLoadGeneration = 0
     @Published var query = ""
     @Published var errorMessage: String?
-    @Published var selection: PlayerSelection?
+    @Published var selection: PlayerSelection? {
+        didSet {
+            // Playing anything but the handoff ends it on the server.
+            if let selection, selection.handoffID == nil { handoff = nil }
+            if selection?.channel.id != oldValue?.channel.id { watchPosition = nil }
+        }
+    }
+    /// A channel left playing on another device, offered until resumed or dismissed.
+    @Published private(set) var handoff: Handoff?
+    /// The broadcast moment on screen, kept current by the player for handoff.
+    var watchPosition: Double?
+    /// AirPlay and Picture in Picture keep playing while the app is in the background.
+    var isExternalPlaybackActive = false
+    var isPictureInPictureActive = false
+    /// The channel playing when the app went away, rejoined if nothing is handed off.
+    private var channelLeft: Channel?
     @Published var isPlayerExpanded = false
     @Published private(set) var captionChoices: [PlaybackCaptionChoice] = []
     @Published private(set) var selectedCaptionChoiceID: String?
@@ -142,8 +157,14 @@ final class AppModel: ObservableObject {
                 timeIntervalSince1970: guide.windowStartTimestamp
                     ?? floor(Date().timeIntervalSince1970 / 3600) * 3600 + Double(target) * 3600
             )
-            if target == 0, selection == nil, let firstChannel = channels.first {
-                play(firstChannel)
+            if target == 0, selection == nil {
+                // Offer the handoff instead of starting something that would cancel it.
+                await refreshHandoff()
+                let left = channelLeft.flatMap { left in channels.first { $0.id == left.id } }
+                channelLeft = nil
+                if handoff == nil, selection == nil, let channel = left ?? channels.first {
+                    play(channel)
+                }
             }
             if channels.isEmpty {
                 errorMessage = "No channels are selected. Choose guide categories in the neTV web settings."
@@ -163,7 +184,85 @@ final class AppModel: ObservableObject {
               !isLoading || !channels.isEmpty else { return }
         isReturnRefreshInProgress = true
         defer { isReturnRefreshInProgress = false }
+        if selection == nil { await refreshHandoff() }
         await loadGuide(offset: 0, blocksGuideInteraction: false)
+    }
+
+    // MARK: Handoff
+
+    func refreshHandoff() async {
+        guard isAuthenticated else { return }
+        do {
+            handoff = try await client.handoff(server: server)
+        } catch {
+            logger.debug("Handoff unavailable: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// The guide's channel for a handoff, which also says whether it's still visible here.
+    func channel(for handoff: Handoff) -> Channel? {
+        channels.first { $0.id == handoff.streamID }?.channel
+    }
+
+    /// Plays the handoff from where it stopped, however far live has moved on.
+    func resumeHandoff() {
+        guard let handoff else { return }
+        guard let channel = channel(for: handoff) else {
+            errorMessage = "\(handoff.channelName) isn't in your guide on this device."
+            return
+        }
+        selection = PlayerSelection(
+            channel: channel, program: handoff.program,
+            catchupStart: handoff.position, handoffID: handoff.id
+        )
+        self.handoff = nil
+    }
+
+    func dismissHandoff() {
+        handoff = nil
+        let server = server
+        Task {
+            do {
+                try await client.dismissHandoff(server: server)
+            } catch {
+                logger.warning("Dismissing handoff failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    func reportWatch(_ playing: PlayerSelection, position: Double) async {
+        guard selection?.id == playing.id else { return }
+        let report = HandoffReport(
+            streamID: playing.channel.id, position: position, handoffID: playing.handoffID ?? ""
+        )
+        do {
+            try await client.reportHandoff(server: server, report: report, stopped: false)
+        } catch {
+            logger.debug("Handoff report failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// The app is going away: hand the channel off and stop playing it here,
+    /// so coming back offers it like any other device would.
+    @discardableResult
+    func leavePlayback() -> Task<Void, Never>? {
+        guard let playing = selection, !isExternalPlaybackActive, !isPictureInPictureActive else { return nil }
+        channelLeft = playing.channel
+        let report = watchPosition.map {
+            HandoffReport(streamID: playing.channel.id, position: $0, handoffID: playing.handoffID ?? "")
+        }
+        isPlayerExpanded = false
+        selection = nil
+        guard let report else { return nil }
+        let server = server
+        return Task {
+            do {
+                try await client.reportHandoff(server: server, report: report, stopped: true)
+            } catch {
+                logger.warning("Handoff stop failed: \(error.localizedDescription, privacy: .public)")
+            }
+            await refreshHandoff()
+        }
     }
 
     func canPlayProgram(_ program: Program, in row: ChannelRow) -> Bool {
@@ -221,7 +320,9 @@ final class AppModel: ObservableObject {
         now: Double = Date().timeIntervalSince1970
     ) throws {
         guard selection?.id == playing.id else { return }
-        guard playing.isCatchup, timestamp.isFinite, playing.channel.catchupDays > 0 else {
+        // A handoff recording seeks within what the server recorded.
+        let hasArchive = playing.channel.catchupDays > 0
+        guard playing.isCatchup, timestamp.isFinite, hasArchive || playing.handoffID != nil else {
             throw APIError.server("This stream does not support archive seeking.")
         }
         if timestamp >= now - 30 {
@@ -229,14 +330,14 @@ final class AppModel: ObservableObject {
             selection?.startPaused = !resume
             return
         }
-        let oldest = now - Double(playing.channel.catchupDays) * 86_400 + 60
+        let oldest = hasArchive ? now - Double(playing.channel.catchupDays) * 86_400 + 60 : 0
         let target = floor(max(timestamp, oldest))
         guard let end = playing.program?.endTimestamp, target < end else {
             throw APIError.server("This program is no longer available in the upstream archive.")
         }
         selection = PlayerSelection(
             channel: playing.channel, program: playing.program,
-            catchupStart: target, startPaused: !resume
+            catchupStart: target, startPaused: !resume, handoffID: playing.handoffID
         )
     }
 
@@ -256,7 +357,8 @@ final class AppModel: ObservableObject {
     func continueArchive(after playing: PlayerSelection, now: Double = Date().timeIntervalSince1970) {
         guard selection?.id == playing.id, playing.isCatchup,
               let end = playing.program?.endTimestamp else { return }
-        if end >= now - 30 {
+        // A handoff recording on a channel without an archive has nothing after it.
+        if end >= now - 30 || playing.channel.catchupDays == 0 {
             play(playing.channel)
         } else {
             playArchive(playing, at: end, resume: true, now: now, roundUp: true)
@@ -280,7 +382,7 @@ final class AppModel: ObservableObject {
         else { return false }
         selection = PlayerSelection(
             channel: playing.channel, program: program,
-            catchupStart: floor(timestamp), startPaused: !resume
+            catchupStart: floor(timestamp), startPaused: !resume, handoffID: playing.handoffID
         )
         return true
     }
@@ -328,7 +430,8 @@ final class AppModel: ObservableObject {
             }
             let configuration = try await client.playbackConfiguration(
                 server: requestServer, channelID: selection.channel.id,
-                bandwidthSaver: bandwidthSaver, catchupStart: selection.catchupStart
+                bandwidthSaver: bandwidthSaver, catchupStart: selection.catchupStart,
+                handoffID: selection.handoffID
             )
             if let sessionID = configuration.transcodeSessionID {
                 playbackSessionToRelease = (requestServer, sessionID)
@@ -363,6 +466,7 @@ final class AppModel: ObservableObject {
 
     func signOut() async {
         await client.logout(server: server)
+        handoff = nil
         channels = []
         guideCategories = []
         isAuthenticated = false

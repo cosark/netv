@@ -125,6 +125,23 @@
   </div>
   {% endif %}
 
+  <!-- Handoff: a channel left playing on another device (filled by handoff-card.js) -->
+  <div id="handoff-card" class="hidden flex items-center gap-3 bg-gray-900 border border-blue-500/60 rounded-lg p-2 sm:p-3 mb-2 sm:mb-4" role="region" aria-label="Continue watching">
+    <a id="handoff-resume" href="#" class="flex flex-1 min-w-0 items-center gap-3 focusable rounded focus:outline-none focus:ring-2 focus:ring-blue-500" data-nav="handoff" tabindex="0">
+      <span class="flex-shrink-0 w-9 h-9 rounded-full bg-blue-600 flex items-center justify-center" aria-hidden="true">
+        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      </span>
+      <span class="min-w-0">
+        <span class="block text-[10px] font-semibold tracking-[0.15em] text-blue-300">CONTINUE WATCHING</span>
+        <span id="handoff-title" class="block font-semibold truncate"></span>
+        <span id="handoff-detail" class="block text-xs text-gray-400 truncate"></span>
+      </span>
+    </a>
+    <button id="handoff-dismiss" type="button" class="flex-shrink-0 p-2 text-gray-400 hover:text-white focusable rounded" title="Dismiss" aria-label="Dismiss">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+
   <!-- Mobile header (outside scroll container, stays visible in portrait, hidden in landscape) -->
   <div class="compact-only mobile-header items-center justify-between gap-1 p-2 bg-gray-900 border-b border-gray-700 rounded-t-lg">
     <div class="flex items-center gap-1">
@@ -272,6 +289,7 @@
 
 {% block scripts %}
 <script src="/static/js/virtual-guide.js"></script>
+<script src="/static/js/handoff-card.js"></script>
 <script>
 // Virtual scroll configuration
 const GUIDE_CONFIG = {

@@ -1,0 +1,279 @@
+"""Tests for handoff.py."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import json
+
+import pytest
+
+import handoff
+
+
+NOW = 1_800_000_000.0
+
+
+@pytest.fixture(autouse=True)
+def _state(tmp_path: Path):
+    users = tmp_path / "users"
+    (users / "ann").mkdir(parents=True)
+    handoff.load(users)
+    handoff._watches.clear()
+    handoff._recorders.clear()
+    handoff._generations.clear()
+    with patch("ffmpeg_command.get_transcode_dir", return_value=tmp_path):
+        yield users
+    handoff._users_dir = None
+    handoff._records.clear()
+    handoff._watches.clear()
+    handoff._recorders.clear()
+
+
+def _channel(catchup_days: int = 0, **overrides) -> handoff.Channel:
+    channel = handoff.Channel(
+        stream_id="7",
+        name="News",
+        url="http://upstream.test/live/u/p/7.m3u8",
+        catchup_days=catchup_days,
+        program_title="Evening News",
+        program_start=NOW - 1800,
+        program_end=NOW + 1800,
+    )
+    for key, value in overrides.items():
+        setattr(channel, key, value)
+    return channel
+
+
+def _process(running: bool = True) -> MagicMock:
+    process = MagicMock()
+    process.poll.return_value = None if running else 0
+    return process
+
+
+def _watch(
+    seconds: float, position: float = NOW - 5, handoff_id: str = "", now: float = NOW
+) -> None:
+    handoff.report_watch("ann", "7", now - seconds, handoff_id, now=now - seconds)
+    handoff.report_watch("ann", "7", position, handoff_id, now=now)
+
+
+def _stop(channel, position: float = NOW - 5, handoff_id: str = "", release=None, now=NOW):
+    return handoff.stop_watch(
+        "ann",
+        "7",
+        position,
+        lambda _stream_id, _position: channel,
+        release or MagicMock(),
+        handoff_id,
+        now=now,
+    )
+
+
+class TestStop:
+    def test_short_views_are_not_handed_off(self):
+        _watch(60)
+        assert _stop(_channel(catchup_days=2)) is None
+        assert handoff.current("ann", now=NOW) is None
+
+    def test_stop_without_a_watch_is_ignored(self):
+        assert _stop(_channel(catchup_days=2)) is None
+
+    def test_archived_channel_resumes_as_catchup(self, _state):
+        _watch(600)
+        record = _stop(_channel(catchup_days=2))
+        assert record["mode"] == "catchup"
+        assert record["position"] == NOW - 5
+        assert record["program_title"] == "Evening News"
+        assert handoff.current("ann", now=NOW)["id"] == record["id"]
+        saved = json.loads((_state / "ann" / "handoff.json").read_text())
+        assert saved["id"] == record["id"]
+
+    def test_channel_without_archive_records_until_program_end(self):
+        release = MagicMock()
+        _watch(600)
+        with patch("handoff._start_recorder", return_value=_process()) as start:
+            record = _stop(_channel(), release=release)
+        release.assert_called_once_with("ann", "http://upstream.test/live/u/p/7.m3u8")
+        url, recording_id, seconds = start.call_args.args
+        assert seconds == 1800
+        assert record["mode"] == "recording"
+        assert record["recording_id"] == recording_id
+        assert record["recording_start"] == NOW
+        assert record["expires"] == NOW + 1800 + handoff.KEEP_SECS
+
+    def test_recording_without_guide_end_is_capped(self):
+        _watch(600)
+        with patch("handoff._start_recorder", return_value=_process()) as start:
+            _stop(_channel(program_end=0.0))
+        assert start.call_args.args[2] == handoff.MAX_RECORDING_SECS
+
+    def test_stopping_at_program_end_leaves_nothing(self):
+        _watch(600)
+        assert _stop(_channel(catchup_days=2, program_end=NOW + 10)) is None
+
+    def test_failed_recorder_leaves_nothing(self):
+        _watch(600)
+        with patch("handoff._start_recorder", side_effect=OSError("no ffmpeg")):
+            assert _stop(_channel()) is None
+        assert handoff.current("ann", now=NOW) is None
+
+
+class TestResume:
+    def _recorded(self):
+        _watch(600)
+        with patch("handoff._start_recorder", return_value=_process()):
+            return _stop(_channel())
+
+    def test_claim_hides_the_card_but_keeps_the_recording(self):
+        record = self._recorded()
+        assert handoff.claim("ann", record["id"])["recording_id"] == record["recording_id"]
+        assert handoff.current("ann", now=NOW) is None
+        assert record["recording_id"] in handoff._recorders
+        assert handoff.claim("ann", "other") is None
+
+    def test_stopping_a_resumed_recording_moves_the_bookmark(self):
+        record = self._recorded()
+        handoff.claim("ann", record["id"])
+        _watch(30, position=NOW + 100, handoff_id=record["id"], now=NOW + 110)
+        with patch("handoff._start_recorder") as start:
+            moved = _stop(_channel(), NOW + 100, record["id"], now=NOW + 110)
+        start.assert_not_called()
+        assert moved["id"] == record["id"]
+        assert moved["position"] == NOW + 100
+        assert handoff.current("ann", now=NOW)["position"] == NOW + 100
+
+    def test_finishing_a_resumed_recording_ends_it(self):
+        record = self._recorded()
+        handoff.claim("ann", record["id"])
+        _watch(30, position=NOW + 1790, handoff_id=record["id"], now=NOW + 1800)
+        with patch("handoff._stop_recorder") as stop:
+            assert _stop(_channel(), NOW + 1790, record["id"], now=NOW + 1800) is None
+        stop.assert_called_once_with(record["recording_id"])
+        assert handoff._records == {}
+
+    def test_catchup_resume_rolling_into_the_next_program_hands_off_again(self):
+        _watch(600)
+        record = _stop(_channel(catchup_days=2))
+        handoff.claim("ann", record["id"])
+        later = NOW + 3000
+        _watch(30, position=later - 10, handoff_id=record["id"], now=later)
+        next_program = _channel(
+            catchup_days=2,
+            program_title="Late News",
+            program_start=NOW + 1800,
+            program_end=NOW + 5400,
+        )
+        moved = _stop(next_program, later - 10, record["id"], now=later)
+        assert moved["mode"] == "catchup"
+        assert moved["program_title"] == "Late News"
+        assert moved["position"] == later - 10
+
+
+class TestCancel:
+    def test_cancel_stops_the_recording(self):
+        _watch(600)
+        process = _process()
+        with patch("handoff._start_recorder", return_value=process):
+            record = _stop(_channel())
+        handoff.cancel("ann")
+        process.terminate.assert_called_once()
+        assert handoff.current("ann", now=NOW) is None
+        assert record["recording_id"] not in handoff._recorders
+
+    def test_cancel_keeps_the_handoff_being_resumed(self):
+        _watch(600)
+        record = _stop(_channel(catchup_days=2))
+        handoff.cancel("ann", keep=record["id"])
+        assert handoff.current("ann", now=NOW)["id"] == record["id"]
+
+    def test_cancel_during_recorder_launch_discards_it(self):
+        _watch(600)
+        process = _process()
+
+        def launch(*_args):
+            handoff.cancel("ann")  # Another device starts playing meanwhile
+            return process
+
+        with patch("handoff._start_recorder", side_effect=launch):
+            assert _stop(_channel()) is None
+        process.terminate.assert_called_once()
+        assert handoff._records == {}
+        assert handoff._recorders == {}
+
+
+class TestSweep:
+    def test_lapsed_watch_is_handed_off_at_its_last_position(self):
+        handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
+        handoff.report_watch("ann", "7", NOW - 100, now=NOW - 100)
+        handoff.sweep(lambda *_: _channel(catchup_days=2), MagicMock(), now=NOW)
+        assert handoff.current("ann", now=NOW)["position"] == NOW - 100
+        assert handoff._watches == {}
+
+    def test_fresh_watch_is_left_alone(self):
+        handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
+        handoff.report_watch("ann", "7", NOW - 10, now=NOW - 10)
+        handoff.sweep(lambda *_: _channel(catchup_days=2), MagicMock(), now=NOW)
+        assert handoff.current("ann", now=NOW) is None
+        assert "ann" in handoff._watches
+
+    def test_expired_handoff_is_dropped(self):
+        _watch(600)
+        _stop(_channel(catchup_days=2))
+        handoff.sweep(MagicMock(), MagicMock(), now=NOW + handoff.KEEP_SECS + 1)
+        assert handoff._records == {}
+
+    def test_finished_recorder_is_marked_and_kept(self, tmp_path):
+        _watch(600)
+        with patch("handoff._start_recorder", return_value=_process()):
+            record = _stop(_channel())
+        directory = handoff.recording_dir(record["recording_id"])
+        directory.mkdir()
+        (directory / "stream.m3u8").write_text("#EXTM3U\n")
+        handoff._recorders[record["recording_id"]].poll.return_value = 0
+        handoff.sweep(MagicMock(), MagicMock(), now=NOW + 1)
+        assert handoff._records["ann"]["recording_live"] is False
+        assert handoff.recording_file(record["recording_id"], "stream.m3u8")
+
+    def test_recorder_that_produced_nothing_is_dropped(self):
+        _watch(600)
+        with patch("handoff._start_recorder", return_value=_process()):
+            _stop(_channel())
+        next(iter(handoff._recorders.values())).poll.return_value = 1
+        handoff.sweep(MagicMock(), MagicMock(), now=NOW + 1)
+        assert handoff._records == {}
+
+
+class TestRecordingFiles:
+    def test_only_known_recordings_are_served(self, tmp_path):
+        directory = handoff.recording_dir("abc123")
+        directory.mkdir()
+        (directory / "stream.m3u8").write_text("#EXTM3U\n")
+        assert handoff.recording_file("abc123", "stream.m3u8") is None
+        handoff._records["ann"] = {"id": "h", "recording_id": "abc123"}
+        assert handoff.recording_file("abc123", "stream.m3u8") == directory / "stream.m3u8"
+        assert handoff.recording_file("abc123", "../stream.m3u8") is None
+        assert handoff.recording_file("../x", "stream.m3u8") is None
+
+    def test_orphaned_recordings_are_deleted(self, tmp_path):
+        kept = handoff.recording_dir("kept")
+        orphan = handoff.recording_dir("orphan")
+        kept.mkdir()
+        orphan.mkdir()
+        handoff._records["ann"] = {"id": "h", "recording_id": "kept"}
+        handoff.cleanup_orphans()
+        assert kept.exists()
+        assert not orphan.exists()
+
+    def test_recorder_stops_at_the_requested_time(self, tmp_path):
+        with (
+            patch("ffmpeg_command.get_settings", return_value={"probe_live": False}),
+            patch("ffmpeg_command.resolve_hls_master_playlist", side_effect=lambda u: u),
+            patch("ffmpeg_command.get_user_agent", return_value=None),
+        ):
+            cmd = handoff._recorder_command("http://upstream.test/7.m3u8", tmp_path, 1800.4)
+        i = cmd.index("-i")
+        assert cmd[i - 2 : i + 2] == ["-t", "1800", "-i", "http://upstream.test/7.m3u8"]
+        assert "event" in cmd
+        assert cmd[-1] == f"{tmp_path}/stream.m3u8"

@@ -11,7 +11,18 @@ private final class ArchiveTransport: URLProtocol {
         Self.requests.append(request)
         let url = request.url!
         let body: String
-        if url.path.hasPrefix("/play/live/") {
+        if url.path.hasPrefix("/play/live/"), url.query?.contains("handoff=") == true {
+            body = """
+                rawUrl: "/handoff/rec1/stream.m3u8",
+                transcodeMode: "never", sourceId: "test", deinterlaceFallback: false,
+                catchupStart: 1700000000.0, catchupSeek: 615.0, liveDvrMins: 30
+                """
+        } else if url.path == "/api/handoff", request.httpMethod == "GET" {
+            body = """
+                {"handoff":{"id":"h1","stream_id":"1","channel_name":"Stream","program_title":"Match",
+                 "program_start":1699999000,"program_end":1700003600,"position":1700000615,"mode":"recording"}}
+                """
+        } else if url.path.hasPrefix("/play/live/") {
             body = """
                 rawUrl: "https://upstream.test/timeshift/user/pass/60/2026-09-28:10-00/1.ts",
                 transcodeMode: "always", sourceId: "test", deinterlaceFallback: false,
@@ -64,6 +75,23 @@ private final class ArchiveTransport: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private extension URLRequest {
+    /// URLProtocol receives uploaded bodies as a stream.
+    func bodyData() -> Data {
+        guard let stream = httpBodyStream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
 }
 
 @main
@@ -147,6 +175,30 @@ struct ArchiveAPIChecks {
                 precondition(query.contains(URLQueryItem(name: "cats", value: "")))
             }
         }
-        print("Archive API checks passed: exact position, VOD mode, heartbeat and forced release")
+        ArchiveTransport.requests = []
+        let handoff = try await client.handoff(server: "http://netv.test")
+        precondition(handoff?.id == "h1" && handoff?.position == 1_700_000_615)
+        precondition(handoff?.program?.endTimestamp == 1_700_003_600)
+        let recording = try await client.playbackConfiguration(
+            server: "http://netv.test", channelID: "1", catchupStart: 1_700_000_615, handoffID: "h1"
+        )
+        let page = ArchiveTransport.requests.first { $0.url?.path == "/play/live/1" }!
+        precondition(page.url?.query == "start=1700000615&handoff=h1")
+        precondition(recording.url.absoluteString == "http://netv.test/handoff/rec1/stream.m3u8")
+        precondition(recording.transcodeSessionID == nil, "Recordings play directly")
+        precondition(recording.archiveStart == 1_700_000_000 && recording.archiveSeek == 615)
+        precondition(!ArchiveTransport.requests.contains { $0.url?.path == "/transcode/start" })
+        try await client.reportHandoff(
+            server: "http://netv.test",
+            report: HandoffReport(streamID: "1", position: 1_700_000_700, handoffID: "h1"),
+            stopped: true
+        )
+        let stop = ArchiveTransport.requests.last!
+        precondition(stop.url?.path == "/api/handoff/stop" && stop.httpMethod == "POST")
+        let sent = try JSONSerialization.jsonObject(with: stop.httpBody ?? stop.bodyData()) as! [String: Any]
+        precondition(sent["stream_id"] as? String == "1" && sent["handoff_id"] as? String == "h1")
+        try await client.dismissHandoff(server: "http://netv.test")
+        precondition(ArchiveTransport.requests.last?.httpMethod == "DELETE")
+        print("Archive API checks passed: exact position, VOD mode, heartbeat, forced release and handoff")
     }
 }

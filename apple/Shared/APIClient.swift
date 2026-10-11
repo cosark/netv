@@ -131,11 +131,13 @@ final class APIClient {
     }
 
     func playbackConfiguration(
-        server: String, channelID: String, bandwidthSaver: Bool = false, catchupStart: Double? = nil
+        server: String, channelID: String, bandwidthSaver: Bool = false, catchupStart: Double? = nil,
+        handoffID: String? = nil
     ) async throws -> PlaybackConfiguration {
-        let path = catchupStart.map { "play/live/\(channelID)?start=\(Int($0))" } ?? "play/live/\(channelID)"
         guard let baseURL = normalizedServerURL(server),
-              let playerPageURL = URL(string: path, relativeTo: baseURL) else {
+              let playerPageURL = Self.playerPageURL(
+                baseURL: baseURL, channelID: channelID, catchupStart: catchupStart, handoffID: handoffID
+              ) else {
             throw APIError.invalidServer
         }
 
@@ -150,6 +152,9 @@ final class APIClient {
         }
         guard http.statusCode == 200 else {
             if http.statusCode == 401 { throw APIError.authenticationFailed }
+            if handoffID != nil && http.statusCode == 404 {
+                throw APIError.server("This program is no longer available to resume.")
+            }
             if catchupStart != nil && http.statusCode == 404 {
                 throw APIError.server("This program is no longer available to watch from the start.")
             }
@@ -187,6 +192,47 @@ final class APIClient {
             configuration.liveBufferDuration = minutes * 60
         }
         return configuration
+    }
+
+    /// The player page for a channel, live or from a moment of its archive or handoff.
+    static func playerPageURL(
+        baseURL: URL, channelID: String, catchupStart: Double?, handoffID: String?
+    ) -> URL? {
+        var query: [String] = []
+        if let catchupStart { query.append("start=\(Int(catchupStart))") }
+        if let handoffID,
+           let encoded = handoffID.addingPercentEncoding(withAllowedCharacters: .alphanumerics) {
+            query.append("handoff=\(encoded)")
+        }
+        let path = "play/live/\(channelID)" + (query.isEmpty ? "" : "?" + query.joined(separator: "&"))
+        return URL(string: path, relativeTo: baseURL)
+    }
+
+    func handoff(server: String) async throws -> Handoff? {
+        guard let baseURL = normalizedServerURL(server) else { throw APIError.invalidServer }
+        let response: HandoffResponse = try await get("api/handoff", baseURL: baseURL)
+        return response.handoff
+    }
+
+    func dismissHandoff(server: String) async throws {
+        guard let baseURL = normalizedServerURL(server),
+              let url = URL(string: "api/handoff", relativeTo: baseURL) else { throw APIError.invalidServer }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        _ = try await data(for: request, operation: "dismiss handoff")
+    }
+
+    /// Reports where a live channel is playing; `stopped` hands it off to other devices.
+    func reportHandoff(server: String, report: HandoffReport, stopped: Bool) async throws {
+        guard let baseURL = normalizedServerURL(server),
+              let url = URL(string: stopped ? "api/handoff/stop" : "api/handoff/watch", relativeTo: baseURL)
+        else { throw APIError.invalidServer }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(report)
+        _ = try await data(for: request, operation: stopped ? "handoff stop" : "handoff watch")
     }
 
     func keepArchiveAlive(server: String, sessionID: String) async throws {

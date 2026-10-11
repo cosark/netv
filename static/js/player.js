@@ -217,7 +217,8 @@
     return {
       ...base,
       liveSyncDurationCount: options.isVod ? 0 : 3,
-      startPosition: options.isVod ? 0 : -1,
+      // A handoff recording is still growing; begin where it was left off.
+      startPosition: cfg.handoffRecording ? cfg.catchupSeek || 0 : options.isVod ? 0 : -1,
     };
   }
 
@@ -523,7 +524,9 @@
       // Release the upstream connection before the next page starts probing.
       await cleanupTranscode();
       const base = '/play/live/' + encodeURIComponent(cfg.streamId);
-      window.location.href = target >= Date.now() / 1000 - 30
+      // A handoff recording's channel has no archive: anything past it is live.
+      const live = target >= Date.now() / 1000 - 30 || (cfg.handoffRecording && !cfg.catchupDays);
+      window.location.href = live
         ? base
         : base + '?start=' + Math.floor(Math.max(target, archiveStart()));
     } catch (e) {
@@ -545,8 +548,10 @@
   function seekCatchup(target) {
     pendingCatchupSeek = 0;
     const loadedEnd = cfg.catchupStart + seekOffset + Math.max(0, transcodedDuration - 2);
-    if (target >= cfg.catchupStart + seekOffset && target <= loadedEnd) {
-      video.currentTime = target - cfg.catchupStart - seekOffset;
+    // A handoff recording holds nothing before its start, so earlier seeks stop there.
+    const loadedStart = cfg.handoffRecording ? -Infinity : cfg.catchupStart + seekOffset;
+    if (target >= loadedStart && target <= loadedEnd) {
+      video.currentTime = Math.max(0, target - cfg.catchupStart - seekOffset);
       return;
     }
     return openArchiveAt(target);
@@ -572,6 +577,69 @@
     });
     // Carry on with whatever aired next, or rejoin live once caught up.
     video.addEventListener('ended', () => openArchiveAt(Math.max(programEnd, catchupClock())));
+  }
+
+  // ============================================================
+  // Handoff (resume on another device)
+  // ============================================================
+
+  // Recordings are played directly, so how much is seekable comes from the
+  // growing playlist rather than transcode progress.
+  function recordingDuration() {
+    const details = currentHls?.levels?.[currentHls.currentLevel]?.details
+      || currentHls?.levels?.[0]?.details;
+    if (details && Number.isFinite(details.totalduration)) return details.totalduration;
+    return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
+  }
+
+  function setupHandoffRecording() {
+    if (!cfg.handoffRecording) return;
+    const update = () => {
+      transcodedDuration = recordingDuration();
+      applyPendingCatchupSeek();
+    };
+    for (const event of ['loadedmetadata', 'durationchange', 'progress', 'timeupdate']) {
+      video.addEventListener(event, update);
+    }
+  }
+
+  // Broadcast moment on screen, including a catchup seek still waiting to apply.
+  function handoffPosition() {
+    if (!cfg.catchup) return playbackWallClock();
+    return pendingCatchupSeek > 0 ? cfg.catchupStart + pendingCatchupSeek : catchupClock();
+  }
+
+  function handoffReport() {
+    return JSON.stringify({
+      stream_id: cfg.streamId,
+      position: handoffPosition(),
+      handoff_id: cfg.handoffId || '',
+    });
+  }
+
+  // Tell the server where this channel is playing, and when the page goes
+  // away, so another device can offer to pick it up from the same moment.
+  function setupHandoff() {
+    if (cfg.streamType !== 'live') return;
+    let started = false;
+    const report = () => {
+      if (!started || castController?.active) return;
+      fetch('/api/handoff/watch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: handoffReport(),
+      }).catch(() => {});
+    };
+    video.addEventListener('playing', () => {
+      if (started) return;
+      started = true;
+      report();
+    });
+    setInterval(report, 15000);
+    window.addEventListener('pagehide', () => {
+      if (!started || castController?.active) return;
+      navigator.sendBeacon('/api/handoff/stop', new Blob([handoffReport()], { type: 'application/json' }));
+    });
   }
 
   // The guide only supplies the program that was on at page load, so
@@ -1703,6 +1771,8 @@
     setupLiveDvrResume();
     setupLiveProgram();
     setupCatchup();
+    setupHandoffRecording();
+    setupHandoff();
     setupKeyboardControls();
     setupButtonHandlers();
     setupActivityTracking();

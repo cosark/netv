@@ -1966,3 +1966,109 @@ class TestSourceAssignment:
         data = auth_client.get("/api/settings").json()
         assert "sources" not in data
         assert "users" not in data
+
+
+# ===========================================================================
+# Handoff
+# ===========================================================================
+
+
+@pytest.fixture
+def clean_handoff():
+    import handoff
+
+    handoff._records.clear()
+    handoff._watches.clear()
+    yield handoff
+    handoff._records.clear()
+    handoff._watches.clear()
+
+
+def _handoff_record(**overrides):
+    record = {
+        "id": "h1",
+        "stream_id": "src1_42",
+        "channel_name": "Channel",
+        "program_title": "Match",
+        "program_start": 1767261600.0,
+        "program_end": 1767268800.0,
+        "position": 1767264000.0,
+        "mode": "recording",
+        "recording_id": "rec1",
+        "recording_start": 1767263990.0,
+        "resumed": False,
+        "expires": 9e9,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_handoff_api_offers_the_users_handoff(auth_client, clean_handoff):
+    clean_handoff._records["testuser"] = _handoff_record()
+    body = auth_client.get("/api/handoff").json()["handoff"]
+    assert body["id"] == "h1"
+    assert body["stream_id"] == "src1_42"
+    assert "recording_id" not in body
+    clean_handoff._records["testuser"]["resumed"] = True
+    assert auth_client.get("/api/handoff").json() == {"handoff": None}
+
+
+def test_handoff_recording_resumes_from_where_it_was_left(auth_client, clean_handoff):
+    from main import PlayerInfo
+
+    clean_handoff._records["testuser"] = _handoff_record()
+    info = PlayerInfo(url="http://upstream.test/live/u/p/42.m3u8", channel_name="Channel")
+    with patch("main._get_live_player_info", return_value=info):
+        response = auth_client.get("/play/live/src1_42?handoff=h1")
+    assert response.status_code == 200
+    assert '"/handoff/rec1/stream.m3u8"' in response.text
+    assert 'transcodeMode: "never"' in response.text
+    assert "catchupSeek: 10.0" in response.text
+    assert "handoffRecording: true" in response.text
+    assert clean_handoff._records["testuser"]["resumed"] is True
+
+
+def test_handoff_catchup_resumes_through_the_archive(auth_client, clean_handoff):
+    from main import PlayerInfo
+
+    clean_handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
+    info = PlayerInfo(url="http://upstream.test/timeshift/x.ts", catchup_start=1767264000.0)
+    with patch("main._get_catchup_player_info", return_value=info) as get_info:
+        response = auth_client.get("/play/live/src1_42?handoff=h1")
+    assert response.status_code == 200
+    get_info.assert_called_once_with("src1_42", 1767264000.0)
+
+
+def test_playing_something_else_cancels_the_handoff(auth_client, clean_handoff):
+    from main import PlayerInfo
+
+    clean_handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
+    info = PlayerInfo(url="https://example.test/live.m3u8", channel_name="Other")
+    with patch("main._get_live_player_info", return_value=info):
+        auth_client.get("/play/live/other")
+    assert "testuser" not in clean_handoff._records
+
+
+def test_stale_handoff_cannot_be_resumed(auth_client, clean_handoff):
+    clean_handoff._records["testuser"] = _handoff_record(mode="catchup", recording_id="")
+    response = auth_client.get("/play/live/src1_42?handoff=gone")
+    assert response.status_code == 404
+    assert clean_handoff._records["testuser"]["id"] == "h1", "An old link keeps the newer handoff"
+
+
+def test_handoff_stop_hands_off_the_watched_channel(auth_client, clean_handoff):
+    import handoff
+
+    now = datetime.now(UTC).timestamp()
+    clean_handoff._watches["testuser"] = handoff._Watch("src1_42", now - 10, now - 600, now - 15)
+    channel = handoff.Channel("src1_42", "Channel", "http://x/42.m3u8", catchup_days=2)
+    with (
+        patch("main._handoff_stream_allowed", return_value=True),
+        patch("main._handoff_channel", return_value=channel),
+    ):
+        response = auth_client.post(
+            "/api/handoff/stop", json={"stream_id": "src1_42", "position": now - 5}
+        )
+    assert response.status_code == 200
+    assert clean_handoff._records["testuser"]["mode"] == "catchup"
+    assert clean_handoff._records["testuser"]["position"] == pytest.approx(now - 5)

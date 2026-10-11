@@ -257,6 +257,8 @@ window.PLAYER_CONFIG = {
   catchupDays: {{ catchup_days | default(0) | tojson }},
   catchupStart: {{ catchup_start | default(0) | tojson }},
   catchupSeek: {{ catchup_seek | default(0) | tojson }},
+  handoffId: {{ handoff_id | default('') | tojson }},
+  handoffRecording: {{ handoff_recording | default(false) | tojson }},
   isVod: {{ stream_type | tojson }} === 'movie' || {{ stream_type | tojson }} === 'series' || {{ ((catchup_start | default(0)) > 0) | tojson }},
   streamId: {{ stream_id | tojson }},
   programStart: {{ program_start | tojson }},

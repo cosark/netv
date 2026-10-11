@@ -26,11 +26,17 @@ final class APIClient {
     static var guideDelays: [Int: UInt64] = [:]
     static var failingGuideOffset: Int?
     static var loginError: URLError?
+    static var handoffResponse: Handoff?
+    static var requestedHandoffs: [String?] = []
+    static var handoffReports: [(report: HandoffReport, stopped: Bool)] = []
+    static var dismissedHandoffs = 0
     func playbackConfiguration(
-        server: String, channelID: String, bandwidthSaver: Bool, catchupStart: Double?
+        server: String, channelID: String, bandwidthSaver: Bool, catchupStart: Double?,
+        handoffID: String? = nil
     ) async throws -> PlaybackConfiguration {
         Self.requestedSaver.append(bandwidthSaver)
         Self.requestedCatchup.append(catchupStart)
+        Self.requestedHandoffs.append(handoffID)
         Self.starts += 1
         let id = "session-\(Self.starts)"
         Self.active.insert(id)
@@ -66,6 +72,14 @@ final class APIClient {
     }
     func reportPlaybackHealth(server: String, sessionID: String, health: PlaybackHealth) async throws -> PlaybackHealthResponse {
         PlaybackHealthResponse(bandwidthSaver: Self.saverResponse)
+    }
+    func handoff(server: String) async throws -> Handoff? { Self.handoffResponse }
+    func dismissHandoff(server: String) async throws {
+        Self.dismissedHandoffs += 1
+        Self.handoffResponse = nil
+    }
+    func reportHandoff(server: String, report: HandoffReport, stopped: Bool) async throws {
+        Self.handoffReports.append((report, stopped))
     }
 }
 
@@ -224,6 +238,7 @@ struct PlaybackStartChecks {
         precondition(archived.transcodeSessionID != live.transcodeSessionID)
         await model.stopPlayback(sessionID: live.transcodeSessionID!)
         try await checkGuideNavigation(model)
+        try await checkHandoff(model)
         for code in [URLError.Code.notConnectedToInternet, .timedOut] {
             APIClient.loginError = URLError(code)
             model.isAuthenticated = false
@@ -233,7 +248,7 @@ struct PlaybackStartChecks {
             precondition(!model.isLoading && !model.isAuthenticated)
         }
         APIClient.loginError = nil
-        print("Playback startup checks passed: cancellation, rapid tuning, failed release, recovery, catchup")
+        print("Playback startup checks passed: cancellation, rapid tuning, failed release, recovery, catchup, handoff")
     }
 
     @MainActor
@@ -331,6 +346,82 @@ struct PlaybackStartChecks {
         precondition(APIClient.guideOffsets.count == guideRequestCount, "Signed-out guide returns must not load")
         model.isAuthenticated = true
         APIClient.guideDelays = [:]
+    }
+
+    @MainActor
+    private static func checkHandoff(_ model: AppModel) async throws {
+        let now = Date().timeIntervalSince1970
+        let payload: [String: Any] = [
+            "rows": [
+                ["channel": ["stream_id": "first", "name": "First", "icon": ""], "programs": []],
+                ["channel": ["stream_id": "left", "name": "Left", "icon": ""], "programs": []],
+            ],
+            "categories": [], "total": 2,
+        ]
+        APIClient.guideResponses = [0: String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)]
+        APIClient.handoffResponse = try JSONDecoder().decode(Handoff.self, from: Data("""
+            {"id":"h1","stream_id":"left","channel_name":"Left","program_title":"Match",
+             "program_start":\(now - 3600),"program_end":\(now + 3600),"position":\(now - 1200),"mode":"recording"}
+            """.utf8))
+        model.selection = nil
+        await model.loadGuide(offset: 0)
+        precondition(model.selection == nil, "A pending handoff must not be replaced by autoplay")
+        precondition(model.handoff?.id == "h1", "Opening the app offers the handoff")
+
+        model.resumeHandoff()
+        let resumed = model.selection!
+        precondition(model.handoff == nil, "Resuming takes the card away")
+        precondition(resumed.channel.id == "left" && resumed.handoffID == "h1")
+        precondition(resumed.catchupStart == now - 1200, "Resume from where playback stopped, not live")
+        precondition(resumed.program?.endTimestamp == now + 3600, "The resumed timeline spans the handoff's program")
+        _ = try await model.playerConfiguration(for: resumed)
+        precondition(APIClient.requestedHandoffs.last == "h1", "The player page must know it resumes the handoff")
+
+        // Seeking in a recording of a channel without an archive keeps the recording.
+        try model.seekCatchup(resumed, to: now - 1500, resume: true, now: now)
+        let sought = model.selection!
+        precondition(sought.handoffID == "h1" && sought.catchupStart == floor(now - 1500))
+        model.continueArchive(after: PlayerSelection(
+            channel: sought.channel, program: Program(title: "Old", startTimestamp: now - 7200, endTimestamp: now - 3600),
+            catchupStart: now - 7200, handoffID: "h1"
+        ), now: now)
+        precondition(model.selection == sought, "Ignore archive ends from a replaced player")
+        let ended = PlayerSelection(
+            channel: sought.channel, program: Program(title: "Old", startTimestamp: now - 7200, endTimestamp: now - 3600),
+            catchupStart: now - 7200, handoffID: "h1"
+        )
+        model.selection = ended
+        model.continueArchive(after: ended, now: now)
+        precondition(model.selection?.isCatchup == false && model.selection?.handoffID == nil,
+                     "A finished recording goes live on a channel without an archive")
+
+        // Leaving the app hands off the moment on screen and stops playing here.
+        model.watchPosition = now - 30
+        let reportsBefore = APIClient.handoffReports.count
+        await model.leavePlayback()?.value
+        precondition(model.selection == nil, "Leaving the app stops playback here")
+        let stop = APIClient.handoffReports[reportsBefore]
+        precondition(stop.stopped && stop.report.streamID == "left" && stop.report.position == now - 30)
+        APIClient.handoffResponse = nil
+        await model.loadGuide(offset: 0)
+        precondition(model.selection?.channel.id == "left", "Without a handoff, rejoin the channel that was left")
+
+        // Playing anything else drops the card, and dismissing tells the server.
+        APIClient.handoffResponse = try JSONDecoder().decode(Handoff.self, from: Data("""
+            {"id":"h2","stream_id":"left","channel_name":"Left","program_title":"",
+             "program_start":0,"program_end":0,"position":\(now - 60),"mode":"catchup"}
+            """.utf8))
+        await model.refreshHandoff()
+        precondition(model.handoff?.id == "h2")
+        model.play(model.channels[0])
+        precondition(model.handoff == nil, "Playing something else ends the handoff")
+        await model.refreshHandoff()
+        model.dismissHandoff()
+        precondition(model.handoff == nil)
+        while APIClient.dismissedHandoffs == 0 { await Task.yield() }
+        model.selection = nil
+        model.channels = []
+        APIClient.guideResponses = [:]
     }
 
     @MainActor

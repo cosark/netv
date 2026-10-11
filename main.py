@@ -58,6 +58,7 @@ from cache import (
     DEFAULT_LIVE_DVR_MINS,
     LOGO_BROWSER_TTL,
     LOGO_MAX_SIZE,
+    USERS_DIR,
     Source,
     clamp_live_dvr_mins,
     clear_all_caches,
@@ -105,6 +106,7 @@ import catchup
 import epg
 import ffmpeg_command
 import ffmpeg_session
+import handoff
 import playlists
 
 
@@ -209,6 +211,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pass
     # Clean up orphaned dirs and recover valid VOD sessions
     ffmpeg_session.cleanup_and_recover_sessions()
+    handoff.load(USERS_DIR)
+    handoff.cleanup_orphans()
 
     # Preload all data in background threads (parallel)
     def load_live():
@@ -274,6 +278,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
     cleanup_thread.start()
 
+    # Hand off channels whose devices stopped reporting, and expire handoffs
+    def handoff_loop():
+        while not cleanup_stop.wait(15):
+            try:
+                handoff.sweep(_handoff_channel, ffmpeg_session.stop_user_stream)
+            except Exception:
+                log.exception("Handoff sweep failed")
+
+    threading.Thread(target=handoff_loop, daemon=True).start()
+
     # EPG scheduler
     scheduler_stop = threading.Event()
     _last_triggered: dict[str, str] = {}  # source_id -> last triggered date and time
@@ -329,6 +343,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler_stop.set()
     await asyncio.to_thread(casting.manager.close)
     ffmpeg_session.shutdown()
+    handoff.shutdown()
 
 
 app = FastAPI(title="neTV", lifespan=lifespan)
@@ -1514,6 +1529,7 @@ class PlayerInfo:
     catchup_days: int = 0  # Days of upstream archive for live streams (0 = none)
     catchup_start: float = 0.0  # Unix time the archived stream starts at
     catchup_seek: float = 0.0  # Seconds into the archived stream to start playing
+    handoff_recording: bool = False  # Plays a handoff recording kept on this server
 
 
 def _get_episode_desc(ep: dict) -> str:
@@ -1769,6 +1785,62 @@ def _ensure_live_cache() -> None:
             load_all_epg(get_cache().get("epg_urls", []))
 
 
+def _handoff_channel(stream_id: str, position: float) -> handoff.Channel | None:
+    """A live channel and the program airing on it at ``position``."""
+    info = _get_live_player_info(stream_id)
+    stream = _find_live_stream(stream_id) if info.url else None
+    if not stream:
+        return None
+    channel = handoff.Channel(
+        stream_id=stream_id,
+        name=info.channel_name,
+        url=info.url,
+        source_id=info.source_id,
+        catchup_days=info.catchup_days,
+        program_title=info.program_title,
+        program_start=info.program_start,
+        program_end=info.program_end,
+    )
+    if not info.program_start <= position < info.program_end:
+        program = _find_archived_program(stream, datetime.fromtimestamp(position, UTC))
+        channel.program_title = program.title if program else ""
+        channel.program_start = program.start.timestamp() if program else 0.0
+        channel.program_end = program.stop.timestamp() if program else 0.0
+    # Catchup only reaches back as far as the archive holds.
+    if channel.catchup_days and not catchup.can_play(
+        stream, datetime.fromtimestamp(position - handoff.ARCHIVE_LAG_SECS, UTC)
+    ):
+        channel.catchup_days = 0
+    return channel
+
+
+def _get_handoff_player_info(
+    username: str, stream_id: str, handoff_id: str, start: float | None
+) -> PlayerInfo:
+    """Player info resuming a handoff, from where it was left or from ``start``."""
+    record = handoff.claim(username, handoff_id)
+    if not record or record["stream_id"] != stream_id:
+        raise HTTPException(404, "This program is no longer available to resume")
+    position = record["position"] if start is None else start
+    if record["mode"] == "catchup":
+        # Archives trail the broadcast by up to a minute.
+        return _get_catchup_player_info(
+            stream_id, min(position, time.time() - handoff.ARCHIVE_LAG_SECS)
+        )
+    info = _get_live_player_info(stream_id)
+    if not info.url:
+        return info
+    recording_start = record["recording_start"]
+    info.url = f"/handoff/{record['recording_id']}/stream.m3u8"
+    info.program_title = record["program_title"] or info.program_title
+    info.program_start = record["program_start"]
+    info.program_end = record["program_end"]
+    info.catchup_start = recording_start
+    info.catchup_seek = max(0.0, position - recording_start)
+    info.handoff_recording = True
+    return info
+
+
 @app.get("/play/{stream_type}/{stream_id:path}", response_class=HTMLResponse)
 async def player_page(
     request: Request,
@@ -1778,11 +1850,16 @@ async def player_page(
     ext: str = "",
     series_id: int | None = None,
     start: float | None = Query(default=None, description="Catchup: unix start of a past program"),
+    handoff_id: str = Query(default="", alias="handoff", description="Resume this handoff"),
 ):
     """Render player page for live/movie/series stream."""
     username = user.get("sub", "")
     next_episode_url = None
-    if stream_type == "live" and start is not None:
+    if stream_type == "live" and handoff_id:
+        info = await asyncio.to_thread(
+            _get_handoff_player_info, username, stream_id, handoff_id, start
+        )
+    elif stream_type == "live" and start is not None:
         info = await asyncio.to_thread(_get_catchup_player_info, stream_id, start)
     elif stream_type == "live":
         info = await asyncio.to_thread(_get_live_player_info, stream_id)
@@ -1797,6 +1874,10 @@ async def player_page(
 
     if not info.url:
         raise HTTPException(404, "Stream not found")
+
+    # Playing anything other than the handoff ends it and its recording. A stale
+    # handoff link has already failed above, leaving a newer handoff in place.
+    await asyncio.to_thread(handoff.cancel, username, handoff_id if stream_type == "live" else "")
 
     # Check user's group access
     unavailable_groups = _unavailable_groups(username)
@@ -1833,7 +1914,10 @@ async def player_page(
     user_settings = load_user_settings(username)
     transcode_mode = server_settings.get("transcode_mode", "auto")
     is_https = request.url.scheme == "https" or "https" in request.headers.get("x-forwarded-proto", "").lower() or "https" in request.headers.get("x-forwarded-scheme", "").lower()
-    if transcode_mode == "auto":
+    if info.handoff_recording:
+        # Recordings are already packaged for every client.
+        transcode_mode = "never"
+    elif transcode_mode == "auto":
         needs_transcode = info.is_m3u or is_catchup or ext in ("mkv", "mp4", "avi", "wmv", "flv")
         mixed_content = is_https and info.url.startswith("http://")
         # Pause/rewind requires a server-side buffer; route live through a
@@ -1886,6 +1970,8 @@ async def player_page(
             "catchup_days": info.catchup_days,
             "catchup_start": info.catchup_start,
             "catchup_seek": info.catchup_seek,
+            "handoff_id": handoff_id if stream_type == "live" else "",
+            "handoff_recording": info.handoff_recording,
         },
     )
 
@@ -3532,6 +3618,99 @@ async def get_watch_position_api(
     if entry:
         return {"position": entry.get("position", 0), "duration": entry.get("duration", 0)}
     return {"position": 0, "duration": 0}
+
+
+class HandoffReport(BaseModel):
+    """The broadcast moment on screen while a live channel plays."""
+
+    stream_id: str = Field(min_length=1, max_length=200)
+    position: float = Field(gt=0)
+    handoff_id: str = Field(default="", max_length=64)
+
+
+def _handoff_stream_allowed(username: str, stream_id: str) -> bool:
+    _ensure_live_cache()
+    stream = _find_live_stream(stream_id)
+    return bool(stream and _live_stream_filter(username)(stream))
+
+
+@app.post("/api/handoff/watch")
+async def handoff_watch_api(
+    report: HandoffReport,
+    user: Annotated[dict, Depends(require_auth)],
+):
+    """Note where a live channel is playing, so it can be resumed elsewhere."""
+    handoff.report_watch(
+        user.get("sub", ""), report.stream_id, min(report.position, time.time()), report.handoff_id
+    )
+    return {"status": "ok"}
+
+
+@app.post("/api/handoff/stop")
+async def handoff_stop_api(
+    report: HandoffReport,
+    user: Annotated[dict, Depends(require_auth)],
+):
+    """Playback stopped on a device: offer it on the others (sendBeacon-friendly)."""
+    username = user.get("sub", "")
+    if not await asyncio.to_thread(_handoff_stream_allowed, username, report.stream_id):
+        raise HTTPException(404, "Stream not found")
+    await asyncio.to_thread(
+        handoff.stop_watch,
+        username,
+        report.stream_id,
+        report.position,
+        _handoff_channel,
+        ffmpeg_session.stop_user_stream,
+        report.handoff_id,
+    )
+    return {"status": "ok"}
+
+
+@app.get("/api/handoff")
+async def handoff_api(user: Annotated[dict, Depends(require_auth)]):
+    """The channel left playing on another device, if any."""
+    record = handoff.current(user.get("sub", ""))
+    if not record:
+        return JSONResponse({"handoff": None}, headers={"Cache-Control": "no-store"})
+    keys = (
+        "id",
+        "stream_id",
+        "channel_name",
+        "program_title",
+        "program_start",
+        "program_end",
+        "position",
+        "mode",
+    )
+    return JSONResponse(
+        {"handoff": {key: record[key] for key in keys}},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/handoff")
+async def handoff_dismiss_api(user: Annotated[dict, Depends(require_auth)]):
+    """Dismiss the handoff, ending its recording."""
+    await asyncio.to_thread(handoff.cancel, user.get("sub", ""))
+    return {"status": "ok"}
+
+
+@app.get("/handoff/{recording_id}/{filename}")
+async def handoff_file(recording_id: str, filename: str):
+    """Serve a handoff recording (no auth - recording IDs are unguessable)."""
+    path = handoff.recording_file(recording_id, filename)
+    if path is None:
+        raise HTTPException(404, "File not found")
+    if filename.endswith(".m3u8"):
+        return Response(
+            content=path.read_text(),
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    if not filename.endswith(".ts"):
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, media_type="video/mp2t")
 
 
 # User management endpoints

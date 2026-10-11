@@ -36,6 +36,20 @@ struct WatchView: View {
         }
         .task { await refreshGuideIfVisible() }
         .onChange(of: scenePhase) { _, phase in
+            // Leaving the app (or the TV going to sleep) stops watching here;
+            // the channel is offered on every device, this one included.
+            #if os(iOS)
+            if phase == .background {
+                // Picture in Picture starts as the app leaves; let it claim playback first.
+                Task {
+                    try? await Task.sleep(for: .seconds(1))
+                    guard UIApplication.shared.applicationState == .background else { return }
+                    model.leavePlayback()
+                }
+            }
+            #elseif os(tvOS)
+            if phase == .background { model.leavePlayback() }
+            #endif
             guard phase == .active else { return }
             Task { await refreshGuideIfVisible() }
         }
@@ -67,6 +81,23 @@ struct WatchView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await refreshGuideIfVisible() }
         }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in
+            model.leavePlayback()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            // Give the handoff a moment to reach the server before the app exits.
+            guard let report = model.leavePlayback() else { return }
+            final class Completion { var finished = false }
+            let completion = Completion()
+            Task { @MainActor in
+                await report.value
+                completion.finished = true
+            }
+            let deadline = Date().addingTimeInterval(2)
+            while !completion.finished, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            }
+        }
         #endif
     }
 
@@ -93,10 +124,18 @@ struct WatchView: View {
                                 .frame(width: previewWidth, height: heroHeight)
                         }
                         GuideTheme.divider.frame(height: 1)
+                        if let handoff = model.handoff {
+                            HandoffCard(handoff: handoff)
+                                .frame(width: contentWidth, height: handoffHeight)
+                        }
                         ChannelGuideView(selectedCategoryID: selectedCategoryID)
                             .frame(
                                 width: contentWidth,
-                                height: max(proxy.size.height - heroHeight - 1, 0)
+                                height: max(
+                                    proxy.size.height - heroHeight - 1
+                                        - (model.handoff == nil ? 0 : handoffHeight),
+                                    0
+                                )
                             )
                     }
                 }
@@ -201,6 +240,8 @@ struct WatchView: View {
         #endif
     }
 
+    private var handoffHeight: CGFloat { GuideMetrics.scaled(84) }
+
     private var currentSelection: PlayerSelection? {
         guard let selection = model.selection else { return nil }
         // Archived playback keeps the program it was started for.
@@ -272,6 +313,9 @@ struct WatchView: View {
                     Rectangle()
                         .fill(Color.white.opacity(0.08))
                         .frame(height: 1)
+                    if let handoff = model.handoff {
+                        HandoffCard(handoff: handoff)
+                    }
                     GuideView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -441,5 +485,110 @@ struct WatchView: View {
         withAnimation(.easeInOut(duration: 0.24)) {
             model.isPlayerExpanded.toggle()
         }
+    }
+}
+
+/// Offers the channel left playing on another device, from the moment it stopped.
+private struct HandoffCard: View {
+    @EnvironmentObject private var model: AppModel
+    let handoff: Handoff
+    #if os(macOS) || os(tvOS)
+    private enum Control: Hashable { case resume, dismiss }
+    @FocusState private var focused: Control?
+    #endif
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button {
+                model.resumeHandoff()
+            } label: {
+                HStack(spacing: 14) {
+                    if let channel = model.channel(for: handoff) {
+                        ChannelLogo(channel: channel, size: logoSize)
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("CONTINUE WATCHING")
+                            .font(.caption2.weight(.bold))
+                            .tracking(1.2)
+                            .foregroundStyle(Theme.accent)
+                        Text(title)
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(Theme.secondaryText)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Label("Resume", systemImage: "play.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Theme.accent, in: Capsule())
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            #if os(macOS) || os(tvOS)
+            // tvOS draws no focus for custom content; the guide's style does.
+            .buttonStyle(GuideButtonStyle(isFocused: focused == .resume))
+            .focused($focused, equals: .resume)
+            #else
+            .buttonStyle(.plain)
+            #endif
+            .accessibilityLabel("Resume \(title)")
+            .accessibilityHint(detail)
+
+            Button {
+                model.dismissHandoff()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(8)
+            }
+            #if os(macOS) || os(tvOS)
+            .buttonStyle(GuideButtonStyle(isFocused: focused == .dismiss))
+            .focused($focused, equals: .dismiss)
+            #else
+            .buttonStyle(.plain)
+            .foregroundStyle(Theme.secondaryText)
+            #endif
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.surface)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+        }
+    }
+
+    private var logoSize: CGFloat {
+        #if os(macOS) || os(tvOS)
+        GuideMetrics.scaled(44)
+        #else
+        40
+        #endif
+    }
+
+    private var title: String {
+        handoff.programTitle.isEmpty
+            ? handoff.channelName
+            : "\(handoff.programTitle) · \(handoff.channelName)"
+    }
+
+    private var detail: String {
+        let now = Date().timeIntervalSince1970
+        var parts = [
+            "Left at \(Date(timeIntervalSince1970: handoff.position).formatted(date: .omitted, time: .shortened))"
+        ]
+        let behind = Int((now - handoff.position) / 60)
+        if behind >= 1 { parts.append("\(behind) min behind live") }
+        if handoff.programEnd > now {
+            parts.append("ends \(Date(timeIntervalSince1970: handoff.programEnd).formatted(date: .omitted, time: .shortened))")
+        }
+        return parts.joined(separator: " · ")
     }
 }

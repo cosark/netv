@@ -5,7 +5,7 @@ Chromecast, and Xtream-compatible players.
 
 **What it does:** neTV plays your own Xtream Codes or M3U IPTV subscription
 with a clean, minimal interface — live TV with an EPG grid guide, catchup
-playback, movies & series, favorites and playlists, Chromecast and AirPlay,
+playback, Intelligent Handoff between devices, movies & series, favorites and playlists, Chromecast and AirPlay,
 and optional real-time 4K AI upscaling — on desktop, tablet, mobile, and TV.
 
 ## Companion Apps
@@ -21,6 +21,12 @@ The native SwiftUI source for all three apps is in [`apple/`](apple/). See
 
 > **Live TV, upgraded to 4K.** neTV can AI-upscale 1080p streams to 4K with GPU decoding, TensorRT inference, and NVENC
 > encoding in one real-time playback pipeline.
+
+> **New: Intelligent Handoff.** Turn off the TV mid-match and pick it up on
+> your phone, Mac, or browser from the exact moment you left -- even though
+> live has moved on. neTV keeps the stream going on the server until the
+> program ends and puts it at the top of every device, one tap from resuming.
+> [See how Intelligent Handoff works](#intelligent-handoff).
 
 > **Missed the start? Go back and press play.** Browse earlier guide listings
 > and replay supported upstream archives on the web, Mac, Apple TV, iPhone,
@@ -62,6 +68,7 @@ through their IPTV providers.
 
 - **Live TV** with EPG grid guide
 - **Catchup playback** - Browse **Earlier / Now / Later**, select an available past program, or **Start over** on supported live content. Replay and seek through upstream archives on the web and across the Apple apps. [How it works](#catchup-playback).
+- **Intelligent Handoff** - Stop a live channel on one device and resume it on the web, Mac, iPhone, iPad, or Apple TV from the exact moment you left, even after live has moved on. [How it works](#intelligent-handoff).
 - **Mac, Apple TV, and iPhone apps** on the [App Store](https://apps.apple.com/us/app/netv-personal-tv-player/id6814189386)
 - **Native player gateway** - Bring your neTV channels and settings to Apple TV and other Xtream-compatible players
 - **Movies & Series** with metadata, seasons, episodes
@@ -119,6 +126,39 @@ Update the neTV server and rebuild the Apple apps from the current source to
 use the new controls. Source support does not imply that an updated App Store
 build is already available. See the [Apple app documentation](apple/README.md#catchup-and-archive-seeking)
 for native playback details.
+
+### Intelligent Handoff
+
+**Stop watching on one screen, carry on from the same moment on another.**
+Switch off the Apple TV in the middle of a program, open neTV on your iPhone,
+Mac, or browser, and the channel is waiting at the top of the guide under
+**Continue watching** -- with when you left, how far behind live you are, and
+when the program ends. Tap **Resume** and playback picks up from the exact
+moment you stopped, not wherever live has got to.
+
+- **It follows you automatically:** closing the web player, sending an Apple
+  app to the background, the Apple TV going to sleep, or quitting or sleeping
+  the Mac all count as stopping. If a device simply disappears (power cut,
+  network drop), the server notices within about a minute and hands off from
+  the last moment it reported. AirPlay and Picture in Picture keep playing and
+  are not treated as stopping.
+- **Live keeps going for you:** channels with an upstream archive resume
+  through [catchup](#catchup-playback) with nothing extra running. For channels
+  without one, the server keeps recording until the program ends (up to three
+  hours when the guide has no end time), and you resume -- and seek -- within
+  that recording.
+- **One tap, or none:** the card stays for 24 hours after the program ends.
+  Resume it, dismiss it, or just play something else: starting any other
+  playback on any device cancels the handoff and stops its recording, freeing
+  the provider connection.
+- **No channel surfing noise:** views shorter than two minutes, and stops in a
+  program's final 30 seconds, don't create a handoff.
+
+Recordings are kept in the transcode directory, stream-copied where the codecs
+allow, and can take several GB for a long program. They aren't counted toward
+per-source stream limits, so another neTV user on a one-connection provider can
+hit its limit while a handoff is recording. Update the neTV server and rebuild
+the Apple apps from the current source to use Intelligent Handoff.
 
 ### Apple Apps
 
