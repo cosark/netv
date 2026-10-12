@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypeVar, cast
 from unittest.mock import MagicMock, patch
 
 import json
@@ -13,6 +14,12 @@ import handoff
 
 
 NOW = 1_800_000_000.0
+T = TypeVar("T")
+
+
+def _some(value: T | None) -> T:
+    assert value is not None
+    return value
 
 
 @pytest.fixture(autouse=True)
@@ -82,11 +89,11 @@ class TestStop:
 
     def test_archived_channel_resumes_as_catchup(self, _state):
         _watch(600)
-        record = _stop(_channel(catchup_days=2))
+        record = _some(_stop(_channel(catchup_days=2)))
         assert record["mode"] == "catchup"
         assert record["position"] == NOW - 5
         assert record["program_title"] == "Evening News"
-        assert handoff.current("ann", now=NOW)["id"] == record["id"]
+        assert _some(handoff.current("ann", now=NOW))["id"] == record["id"]
         saved = json.loads((_state / "ann" / "handoff.json").read_text())
         assert saved["id"] == record["id"]
 
@@ -94,7 +101,7 @@ class TestStop:
         release = MagicMock()
         _watch(600)
         with patch("handoff._start_recorder", return_value=_process()) as start:
-            record = _stop(_channel(), release=release)
+            record = _some(_stop(_channel(), release=release))
         release.assert_called_once_with("ann", "http://upstream.test/live/u/p/7.m3u8")
         url, recording_id, seconds = start.call_args.args
         assert seconds == 1800
@@ -124,11 +131,11 @@ class TestResume:
     def _recorded(self):
         _watch(600)
         with patch("handoff._start_recorder", return_value=_process()):
-            return _stop(_channel())
+            return _some(_stop(_channel()))
 
     def test_claim_hides_the_card_but_keeps_the_recording(self):
         record = self._recorded()
-        assert handoff.claim("ann", record["id"])["recording_id"] == record["recording_id"]
+        assert _some(handoff.claim("ann", record["id"]))["recording_id"] == record["recording_id"]
         assert handoff.current("ann", now=NOW) is None
         assert record["recording_id"] in handoff._recorders
         assert handoff.claim("ann", "other") is None
@@ -138,11 +145,11 @@ class TestResume:
         handoff.claim("ann", record["id"])
         _watch(30, position=NOW + 100, handoff_id=record["id"], now=NOW + 110)
         with patch("handoff._start_recorder") as start:
-            moved = _stop(_channel(), NOW + 100, record["id"], now=NOW + 110)
+            moved = _some(_stop(_channel(), NOW + 100, record["id"], now=NOW + 110))
         start.assert_not_called()
         assert moved["id"] == record["id"]
         assert moved["position"] == NOW + 100
-        assert handoff.current("ann", now=NOW)["position"] == NOW + 100
+        assert _some(handoff.current("ann", now=NOW))["position"] == NOW + 100
 
     def test_finishing_a_resumed_recording_ends_it(self):
         record = self._recorded()
@@ -155,7 +162,7 @@ class TestResume:
 
     def test_catchup_resume_rolling_into_the_next_program_hands_off_again(self):
         _watch(600)
-        record = _stop(_channel(catchup_days=2))
+        record = _some(_stop(_channel(catchup_days=2)))
         handoff.claim("ann", record["id"])
         later = NOW + 3000
         _watch(30, position=later - 10, handoff_id=record["id"], now=later)
@@ -165,7 +172,7 @@ class TestResume:
             program_start=NOW + 1800,
             program_end=NOW + 5400,
         )
-        moved = _stop(next_program, later - 10, record["id"], now=later)
+        moved = _some(_stop(next_program, later - 10, record["id"], now=later))
         assert moved["mode"] == "catchup"
         assert moved["program_title"] == "Late News"
         assert moved["position"] == later - 10
@@ -176,7 +183,7 @@ class TestCancel:
         _watch(600)
         process = _process()
         with patch("handoff._start_recorder", return_value=process):
-            record = _stop(_channel())
+            record = _some(_stop(_channel()))
         handoff.cancel("ann")
         process.terminate.assert_called_once()
         assert handoff.current("ann", now=NOW) is None
@@ -184,9 +191,9 @@ class TestCancel:
 
     def test_cancel_keeps_the_handoff_being_resumed(self):
         _watch(600)
-        record = _stop(_channel(catchup_days=2))
+        record = _some(_stop(_channel(catchup_days=2)))
         handoff.cancel("ann", keep=record["id"])
-        assert handoff.current("ann", now=NOW)["id"] == record["id"]
+        assert _some(handoff.current("ann", now=NOW))["id"] == record["id"]
 
     def test_cancel_during_recorder_launch_discards_it(self):
         _watch(600)
@@ -208,7 +215,7 @@ class TestSweep:
         handoff.report_watch("ann", "7", NOW - 700, now=NOW - 700)
         handoff.report_watch("ann", "7", NOW - 100, now=NOW - 100)
         handoff.sweep(lambda *_: _channel(catchup_days=2), MagicMock(), now=NOW)
-        assert handoff.current("ann", now=NOW)["position"] == NOW - 100
+        assert _some(handoff.current("ann", now=NOW))["position"] == NOW - 100
         assert handoff._watches == {}
 
     def test_fresh_watch_is_left_alone(self):
@@ -227,11 +234,11 @@ class TestSweep:
     def test_finished_recorder_is_marked_and_kept(self, tmp_path):
         _watch(600)
         with patch("handoff._start_recorder", return_value=_process()):
-            record = _stop(_channel())
+            record = _some(_stop(_channel()))
         directory = handoff.recording_dir(record["recording_id"])
         directory.mkdir()
         (directory / "stream.m3u8").write_text("#EXTM3U\n")
-        handoff._recorders[record["recording_id"]].poll.return_value = 0
+        cast(MagicMock, handoff._recorders[record["recording_id"]]).poll.return_value = 0
         handoff.sweep(MagicMock(), MagicMock(), now=NOW + 1)
         assert handoff._records["ann"]["recording_live"] is False
         assert handoff.recording_file(record["recording_id"], "stream.m3u8")
@@ -240,7 +247,7 @@ class TestSweep:
         _watch(600)
         with patch("handoff._start_recorder", return_value=_process()):
             _stop(_channel())
-        next(iter(handoff._recorders.values())).poll.return_value = 1
+        cast(MagicMock, next(iter(handoff._recorders.values()))).poll.return_value = 1
         handoff.sweep(MagicMock(), MagicMock(), now=NOW + 1)
         assert handoff._records == {}
 

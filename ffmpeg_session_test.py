@@ -126,7 +126,9 @@ async def test_dvr_remux_start_resolves_master_playlist_once(archive_runtime):
     ):
         result = await ffmpeg_session.start_transcode(master, "live", fast_start=True)
     resolve.assert_called_once_with(master)
-    assert get_session(result["session_id"])["url"] == variant
+    session = get_session(result["session_id"])
+    assert session is not None
+    assert session["url"] == variant
 
 
 @pytest.mark.asyncio

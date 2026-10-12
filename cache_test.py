@@ -298,7 +298,10 @@ class TestEncoderDetection:
 
     def test_detect_encoders_none_available(self):
         """Test detect_encoders when no hardware is available."""
-        with mock.patch.object(cache, "_test_encoder", return_value=(False, "not found")):
+        with (
+            mock.patch.object(cache, "_test_encoder", return_value=(False, "not found")),
+            mock.patch.object(cache, "VAAPI_DEVICE", None),
+        ):
             result = cache.detect_encoders()
             assert result == {
                 "nvenc": False,
