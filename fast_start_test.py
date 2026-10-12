@@ -99,6 +99,20 @@ def test_commands_only_ingest_opens_upstream(tmp_path):
         assert duration * int(cmd[cmd.index("-hls_list_size") + 1]) >= 30
 
 
+def test_ingest_allows_extensionless_hls_segments_only_for_hls(tmp_path):
+    for url in (
+        "https://upstream.example/live/u/p/1.m3u8",
+        "https://upstream.example/live/u/p/1.M3U8?token=x",
+    ):
+        ingest = fast_start.ingest_command(url, str(tmp_path), None)
+        assert ingest[ingest.index("-f") + 1] == "hls"
+        assert ingest[ingest.index("-extension_picky") + 1] == "0"
+        assert ingest.index("-extension_picky") < ingest.index("-i")
+    # The option only exists on the HLS demuxer; raw TS would fail to open.
+    ingest = fast_start.ingest_command("https://upstream.example/live/1.ts", str(tmp_path), None)
+    assert "-extension_picky" not in ingest
+
+
 def test_restart_commands_use_unique_sequences_and_discontinuities(tmp_path):
     ingest = fast_start.ingest_command(
         "https://upstream.example/live.m3u8",

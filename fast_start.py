@@ -6,6 +6,7 @@ import math
 import pathlib
 import re
 import time
+import urllib.parse
 
 from ffmpeg_command import (
     PASSTHROUGH_AUDIO_CODECS,
@@ -52,6 +53,11 @@ def add_live_start_offset(content: str, seconds: float) -> str:
     )
 
 
+def is_hls_url(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path.lower()
+    return path.endswith((".m3u8", ".m3u"))
+
+
 def ingest_command(
     url: str,
     directory: str,
@@ -64,6 +70,10 @@ def ingest_command(
     cmd += http_reconnect_args(url, max_delay=5)
     if user_agent:
         cmd += ["-user_agent", user_agent]
+    if is_hls_url(url):
+        # Providers often serve segments without media extensions. The option
+        # only exists on the HLS demuxer, so it cannot be passed for raw TS.
+        cmd += ["-f", "hls", "-extension_picky", "0"]
     output = [
         "-probesize",
         "5000000",
