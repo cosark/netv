@@ -2072,3 +2072,69 @@ def test_handoff_stop_hands_off_the_watched_channel(auth_client, clean_handoff):
     assert response.status_code == 200
     assert clean_handoff._records["testuser"]["mode"] == "catchup"
     assert clean_handoff._records["testuser"]["position"] == pytest.approx(now - 5)
+
+
+class TestManagedDirectGuide:
+    def test_direct_export_uses_saved_filter_and_never_proxies(self, auth_client):
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "Allowed"},
+            {"category_id": "2", "category_name": "Other"},
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {
+                "stream_id": "src_42",
+                "name": "Xtream",
+                "category_ids": ["1"],
+                "source_type": "xtream",
+                "source_url": "https://provider.test/",
+                "source_username": "user@name",
+                "source_password": "p#ss",
+            },
+            {
+                "stream_id": "m3u_1",
+                "name": "M3U",
+                "category_ids": ["1"],
+                "direct_url": "https://media.test/channel.m3u8",
+            },
+            {
+                "stream_id": "hidden",
+                "name": "Other",
+                "category_ids": ["2"],
+                "direct_url": "https://media.test/hidden.m3u8",
+            },
+        ]
+        with (
+            patch("main.load_user_settings", return_value={"guide_filter": ["1"]}),
+            patch("main._playlist_categories", return_value=[]),
+        ):
+            normal = auth_client.get("/api/guide/rows").json()
+            response = auth_client.get("/api/guide/rows?direct=true")
+        assert all("direct_url" not in row["channel"] for row in normal["rows"])
+        payload = response.json()
+        assert payload["direct_playback"] is True
+        assert all(row["channel"]["catchup_days"] == 0 for row in payload["rows"])
+        assert response.headers["cache-control"] == "no-store"
+        urls = {
+            row["channel"]["stream_id"]: row["channel"]["direct_url"] for row in payload["rows"]
+        }
+        assert urls == {
+            "src_42": "https://provider.test/live/user%40name/p%23ss/42.m3u8",
+            "m3u_1": "https://media.test/channel.m3u8",
+        }
+
+    def test_direct_export_excludes_restricted_channels(self, auth_client):
+        cache_module.get_cache()["live_categories"] = [
+            {"category_id": "1", "category_name": "News"}
+        ]
+        cache_module.get_cache()["live_streams"] = [
+            {
+                "stream_id": "secret",
+                "name": "Secret",
+                "category_ids": ["1"],
+                "direct_url": "https://provider.test/private.m3u8",
+            }
+        ]
+        with patch("main._unavailable_groups", return_value={"cat:1"}):
+            payload = auth_client.get("/api/guide/rows?cats=1&direct=true").json()
+        assert payload["rows"] == []
+        assert payload["direct_playback"] is True

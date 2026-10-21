@@ -1063,6 +1063,9 @@ async def guide_rows_api(
     offset: int = Query(default=0, ge=-168, le=168, description="Hours offset from now"),
     cats: str = "",
     exact: bool = Query(default=False, description="Use cats as-is, without adding playlists"),
+    direct: bool = Query(
+        default=False, description="Include provider URLs for direct-play clients"
+    ),
 ):
     """API endpoint for virtual scrolling - returns guide rows as JSON."""
     username = user.get("sub", "")
@@ -1091,7 +1094,10 @@ async def guide_rows_api(
     total_count = len(streams)
 
     if total_count == 0:
-        return JSONResponse({"rows": [], "categories": [], "total": 0, "start": start})
+        return JSONResponse(
+            {"rows": [], "categories": [], "total": 0, "start": start, "direct_playback": direct},
+            headers={"Cache-Control": "no-store"},
+        )
 
     category_by_id = {
         str(category["category_id"]): category
@@ -1099,9 +1105,7 @@ async def guide_rows_api(
     }
     category_by_id.update({c["category_id"]: c for c in _playlist_categories()})
     populated_category_ids = {
-        str(category_id)
-        for stream in streams
-        for category_id in (stream.get("category_ids") or [])
+        str(category_id) for stream in streams for category_id in (stream.get("category_ids") or [])
     }
     guide_categories = [
         {
@@ -1119,6 +1123,20 @@ async def guide_rows_api(
     window_end = window_start + timedelta(hours=3)
 
     rows = _build_guide_rows(streams, start, count, window_start, window_end)
+    if direct:
+        # Only export URLs from the already permission-filtered guide page.
+        # Nothing is proxied or transcoded; the client connects to the provider.
+        for row, stream in zip(rows, streams[start : start + count], strict=False):
+            url = stream.get("direct_url", "")
+            if not url and stream.get("source_type") == "xtream":
+                base = stream.get("source_url", "").rstrip("/")
+                user_name = urllib.parse.quote(stream.get("source_username", ""), safe="")
+                password = urllib.parse.quote(stream.get("source_password", ""), safe="")
+                upstream_id = str(stream["stream_id"]).rsplit("_", 1)[-1]
+                url = f"{base}/live/{user_name}/{password}/{upstream_id}.m3u8"
+            row["channel"]["direct_url"] = url
+            # This contract exports live URLs only, not archive playback URLs.
+            row["channel"]["catchup_days"] = 0
 
     return JSONResponse(
         {
@@ -1127,6 +1145,7 @@ async def guide_rows_api(
             "total": total_count,
             "start": start,
             "window_start_timestamp": window_start.timestamp(),
+            "direct_playback": direct,
         },
         headers={"Cache-Control": "no-store"},
     )
