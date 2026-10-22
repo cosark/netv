@@ -697,6 +697,10 @@ There's also some useful applications in `tools/`:
 - `alignm3u.py`: Useful for reworking your HDHomeRun m3u to align with guide.
 - `xtream2m3u.py`: Dump xtream to m3u, useful for making Emby work with IPTV.
 
+## One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/neTV/)
+
 ## Troubleshooting
 
 ### Debug Logging
